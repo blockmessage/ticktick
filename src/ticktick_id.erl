@@ -19,7 +19,7 @@
 
 -include("ticktick.hrl").
 
--record(state, { version, machine_id, space_time, sequence }).
+-record(state, { version, machine_id, space_time, sequence, tag, seq_min, seq_max}).
 -define(PROCNAME, ?MODULE).
 -define(TTID_VERSION, 0).
 
@@ -47,7 +47,7 @@ sibling( IdBin ) ->
 	case bin_to_ttid( IdBin) of
 		{ok, TTID} when is_record(TTID, ttid)->
 			Seq = TTID#ttid.sequence,
-			case Seq >= ?TTID_SEQ_MAX of
+			case Seq > get_sequence_max() of
 				true ->
 					{error, exhausted};
 				_ ->
@@ -70,29 +70,32 @@ explain( IdBin ) ->
 init([MachineId]) ->
 	process_flag(trap_exit, true),
 	?INFO("Ticktick running on machine : ~p ~n", [MachineId]),
-	{ok, #state{ version = ?TTID_VERSION, machine_id = MachineId, 
-				 space_time = erlang:now(), sequence = 0 }}.
+	{ok, #state{ version = ?TTID_VERSION, machine_id = MachineId,
+				 space_time = erlang:system_time(milli_seconds), sequence = get_sequence_min(),
+                     tag = get_tag(), seq_min = get_sequence_min(), seq_max = get_sequence_max()}}.
 
-handle_call(id, _From, #state{ space_time = SpaceTime, sequence = Seq } = State) ->	
-	State1 = case timer:now_diff(Now = erlang:now(), SpaceTime) > 1000 of
-				 true ->
-					 %% next space state
-					 State#state{space_time = Now, sequence = 0};
-				 _ ->
-					 State#state{sequence = Seq+1}
-			 end,
+handle_call(id, _From, #state{ space_time = SpaceTime, sequence = Seq,
+                               tag = Tag, seq_min = SeqMin, seq_max = SeqMax} = State) ->
+    Now = erlang:system_time(milli_seconds),
+    State1 = case Now > SpaceTime of
+                 true ->
+                     %% next space state
+                     State#state{space_time = Now, sequence = SeqMin};
+                 _ ->
+                     State#state{sequence = Seq+1}
+             end,
 
-	#state{ version = Ver, machine_id = MID, 
-			space_time = SpaceTime1, 
-			sequence = Seq1} = State1,
+    #state{ version = Ver, machine_id = MID,
+            space_time = SpaceTime1,
+            sequence = Seq1} = State1,
 
-	case Seq1 >= ?TTID_SEQ_MAX of
-		true ->
-			{reply, {error, exhausted}, State};
-		_ ->
-			TTID = to_ttid( Ver, SpaceTime1, Seq1, MID, ?TTID_TAG_NORMAL),
-			{reply, ttid_to_bin(TTID), State1}
-	end;
+    case Seq1 > SeqMax of
+        true ->
+            {reply, {error, exhausted}, State};
+        _ ->
+            TTID = to_ttid( Ver, SpaceTime1, Seq1, MID, Tag),
+            {reply, ttid_to_bin(TTID), State1}
+    end;
 
 handle_call({machine_id, MachineId}, _From, State) ->
     NewState = State#state{machine_id = MachineId},
@@ -117,30 +120,20 @@ code_change(_OldVsn, State, _Extra) ->
 %% internals
 
 to_ttid( Ver, Time, Seq, Mach, Tag ) ->
-	{MegaSeconds, Seconds, MicroSeconds} = Time,
 	#ttid{ version = Ver,
-		   seconds = MegaSeconds*1000000 + Seconds - ?TTID_TIME_BEGIN,
-		   mseconds = MicroSeconds div 1000,
+		   seconds = Time div 1000  - ?TTID_TIME_BEGIN,
+		   mseconds = Time rem 1000,
 		   sequence = Seq,
 		   machine = Mach,
 		   tag = Tag}.
 
-ttid_to_bin( #ttid{ version = Ver, 
+ttid_to_bin( #ttid{ version = Ver,
 					seconds = Sec,
 					mseconds = MSec,
 					sequence = Seq,
 					machine = Mach,
 					tag = Tag } ) ->
-	
-	VerB = fix_size(binary:encode_unsigned(Ver), 2),
-	SecB = fix_size(binary:encode_unsigned(Sec), 30),
-	MSecB = fix_size(binary:encode_unsigned(MSec), 10),
-	SeqB = fix_size(binary:encode_unsigned(Seq), 10),
-	MachB = fix_size(binary:encode_unsigned(Mach), 10),
-	TagB = fix_size(binary:encode_unsigned(Tag), 2),
-	
-	{ok, <<VerB/bits, SecB/bits, MSecB/bits, 
-		   SeqB/bits, MachB/bits, TagB/bits>> }.
+    {ok, <<Ver:2, Sec:30, MSec:10, Seq:10, Mach:10, Tag:2>>}.
 
 fix_size(Bin, Size) when is_integer(Size) andalso bit_size(Bin) =< Size ->
 	%% padding
@@ -159,10 +152,10 @@ bin_to_ttid( IdBin ) ->
 	case bit_size(IdBin) /= ?TTID_BIN_SIZE of
 		true ->
 			{error, invalid_bin};
-		_ -> 
-			<<VerB:2/bits, SecB:30/bits, 
-			  MSecB:10/bits, SeqB:10/bits, 
-			  MachB:10/bits, TagB:2/bits>> = IdBin,	
+		_ ->
+			<<VerB:2/bits, SecB:30/bits,
+			  MSecB:10/bits, SeqB:10/bits,
+			  MachB:10/bits, TagB:2/bits>> = IdBin,
 			TTID = #ttid{
 					  version = bin_to_unsigned(VerB),
 					  seconds = bin_to_unsigned(SecB),
@@ -170,7 +163,7 @@ bin_to_ttid( IdBin ) ->
 					  sequence = bin_to_unsigned(SeqB),
 					  machine = bin_to_unsigned(MachB),
 					  tag = bin_to_unsigned(TagB) },
-			
+
 			{ok, TTID}
 	end.
 
@@ -184,14 +177,22 @@ bin_to_unsigned(Bin) ->
 			 end,
 	Bin1 = fix_size(Bin, Size1),
 	binary:decode_unsigned(Bin1).
-	
+
+get_tag() ->
+    application:get_env(ticktick, tag, ?TTID_TAG_NORMAL).
+
+get_sequence_min() ->
+    application:get_env(ticktick, sequence_min, 0).
+
+get_sequence_max() ->
+    application:get_env(ticktick, sequence_max, ?TTID_SEQ_MAX).
 
 %% Tests
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
-%% function test 
+%% function test
 
 overall_test_() ->
 	{"Simple test on ticktick server.",
@@ -212,16 +213,16 @@ id_seq(_) ->
 	{ok, TTID} = bin_to_ttid(Id),
 	{ok, TTID1} = bin_to_ttid(Id1),
 	io:format("~p ~p~n", [TTID, TTID1]),
-	?assertEqual( TTID#ttid.sequence + 1, TTID1#ttid.sequence ).	
+	?assertEqual( TTID#ttid.sequence + 1, TTID1#ttid.sequence ).
 
-bits_size_test() ->	
+bits_size_test() ->
 	B = binary:encode_unsigned(987654321),
 	[?assertEqual(bit_size(fix_size(B, 2)), 2),
 	 ?assertEqual(bit_size(fix_size(B, 30)), 30)
 	].
 
 binary_id_conv_test() ->
-	TTID = to_ttid( ?TTID_VERSION, erlang:now(), 0, 0, ?TTID_TAG_NORMAL),
+	TTID = to_ttid( ?TTID_VERSION, erlang:system_time(milli_seconds), 0, 0, get_tag()),
 	{ok, IdBin} = ttid_to_bin(TTID),
 	io:format("IdBin: ~p~n", [IdBin]),
 	{ok, TTID1} = bin_to_ttid(IdBin),

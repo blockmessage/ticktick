@@ -11,6 +11,6 @@
 			  }).
 
 -define(TTID_TIME_BEGIN, 1417564800). %% seconds diff to 20141203 00:00:00 GMT
--define(TTID_SEQ_MAX, 1024).
+-define(TTID_SEQ_MAX, 1023).
 -define(TTID_TAG_NORMAL, 0).
 -define(TTID_BIN_SIZE, 64).
